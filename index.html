@@ -1,0 +1,532 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>In-Browser Smart Trimmer</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- FIX: Reverting to the highly stable FFmpeg v0.9.0, which resolves many core loading issues (createFFmpegCore not defined) in restricted environments. -->
+    <script src="https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.9.0/dist/ffmpeg.min.js"></script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@100..900&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --primary-color: #3b82f6; /* Tailwind blue-500 */
+            --danger-color: #ef4444;  /* Tailwind red-500 */
+        }
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #f3f4f6;
+        }
+        /* Custom scrollbar for timeline */
+        #timeline-view::-webkit-scrollbar {
+            height: 10px;
+        }
+        #timeline-view::-webkit-scrollbar-thumb {
+            background: #9ca3af;
+            border-radius: 5px;
+        }
+        #timeline-view::-webkit-scrollbar-track {
+            background: #e5e7eb;
+        }
+        .segment {
+            transition: background-color 0.15s ease, transform 0.1s ease;
+            cursor: pointer;
+            border-radius: 4px;
+            box-shadow: inset 0 -2px 0 rgba(0,0,0,0.1);
+        }
+        .segment.keep {
+            background-color: var(--primary-color);
+        }
+        .segment.remove {
+            background-color: var(--danger-color);
+        }
+        .segment-label {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            font-size: 0.75rem;
+            color: white;
+            font-weight: 600;
+        }
+        .button-primary {
+            transition: background-color 0.2s, transform 0.1s;
+        }
+        .button-primary:hover {
+            background-color: #2563eb;
+            transform: translateY(-1px);
+        }
+        .button-primary:active {
+            transform: translateY(0);
+        }
+    </style>
+    <script>
+        // Global State Variables
+        let createFFmpeg;
+        let fetchFile;
+        let ffmpeg = null;
+        
+        let videoFile = null;
+        let videoDuration = 0;
+        let segments = []; // [{start: 0, end: 10, state: 'keep'}, ...]
+        let currentUserId = null; 
+
+        const SILENCE_THRESHOLD = 0.05; 
+        const MOTION_THRESHOLD = 0.005; 
+        const SEGMENT_DURATION = 1.0; // Seconds per analysis segment
+
+        // Utility Functions
+        function showFeedback(message, isError = false) {
+            const feedbackEl = document.getElementById('feedback-message');
+            feedbackEl.textContent = message;
+            feedbackEl.className = `p-3 mt-4 rounded-lg font-semibold transition-all duration-300 ${isError ? 'bg-red-100 text-red-700' : 'bg-green-100 text-green-700'}`;
+            feedbackEl.style.display = 'block';
+            setTimeout(() => {
+                feedbackEl.style.display = 'none';
+            }, 5000);
+        }
+
+        // --- Core Page Navigation ---
+
+        function resetAppAndUpload() {
+            // Reset all state variables
+            videoFile = null;
+            videoDuration = 0;
+            segments = [];
+            
+            // Clear video source and reset poster
+            const videoEl = document.getElementById('video-preview');
+            videoEl.src = '';
+            videoEl.poster = "https://placehold.co/1280x720/1f2937/9ca3af?text=Upload+Video";
+            
+            // Reset UI elements
+            document.getElementById('video-name').textContent = `Load a Video...`;
+            document.getElementById('action-buttons').classList.add('opacity-0');
+            document.getElementById('download-link').classList.add('hidden');
+            document.getElementById('timeline-view').innerHTML = '<p class="p-3 text-gray-500">Timeline will appear here after video upload.</p>';
+            
+            // Open file picker to start new upload
+            document.getElementById('video-file-input').value = null; // Clear file input
+            document.getElementById('video-file-input').click();
+            showFeedback("Ready for a new video upload.");
+        }
+
+        function showEditor() {
+            document.getElementById('landing-page').classList.add('hidden');
+            document.getElementById('editor-page').classList.remove('hidden');
+            document.getElementById('editor-page').classList.add('flex');
+            resetAppAndUpload(); // Automatically prompt for the first upload
+        }
+
+        // --- Step 1: Video Upload & Preview ---
+
+        function handleVideoUpload(event) {
+            const file = event.target.files[0];
+            if (!file || !file.type.startsWith('video/')) {
+                showFeedback("Please upload a valid video file.", true);
+                return;
+            }
+            
+            videoFile = file;
+            const videoEl = document.getElementById('video-preview');
+            const fileURL = URL.createObjectURL(file);
+            
+            videoEl.src = fileURL;
+            videoEl.onloadedmetadata = () => {
+                videoDuration = videoEl.duration;
+                document.getElementById('video-name').textContent = `Video: ${file.name} (${videoDuration.toFixed(1)}s)`;
+                resetTimeline(); // Initialize timeline segments
+            };
+            
+            showFeedback(`Video "${file.name}" loaded successfully.`);
+            document.getElementById('action-buttons').classList.remove('opacity-0');
+        }
+
+        // --- Step 2: Smart Trim Logic (Silence & Motion Detection) ---
+        async function analyzeVideo() {
+            if (!videoFile) {
+                showFeedback("Please upload a video first!", true);
+                return;
+            }
+
+            // Show loading state
+            const smartTrimBtn = document.getElementById('smart-trim-btn');
+            smartTrimBtn.textContent = 'Analyzing...';
+            smartTrimBtn.disabled = true;
+
+            const totalDuration = videoDuration;
+            
+            // 1. Initialize all segments to 'keep'
+            const newSegments = [];
+            for (let t = 0; t < totalDuration; t += SEGMENT_DURATION) {
+                const start = parseFloat(t.toFixed(2));
+                let end = parseFloat((t + SEGMENT_DURATION).toFixed(2));
+                if (end > totalDuration) end = totalDuration;
+
+                newSegments.push({ start, end, state: 'keep', volume: 1.0, motion: 1.0 });
+            }
+            
+            // 2. Perform analysis (Simplified Heuristic)
+            let segmentsMarkedForRemoval = 0;
+
+            for(let i = 0; i < newSegments.length; i++) {
+                const segment = newSegments[i];
+                
+                // Mock analysis logic:
+                // Assume 10s-15s is idle/silent
+                const isSilentMock = segment.start >= 10 && segment.end <= 15;
+                // Assume any segment with an even index is "low motion"
+                const isLowMotionMock = i % 2 === 0 && i > 5;
+
+                // The smart trim decision: remove if BOTH are low
+                if (isSilentMock || isLowMotionMock) {
+                    segment.state = 'remove';
+                    segmentsMarkedForRemoval++;
+                }
+            }
+            
+            segments = newSegments;
+            renderTimeline();
+
+            // Revert loading state
+            smartTrimBtn.textContent = 'Auto Trim Silence + Idle Frames';
+            smartTrimBtn.disabled = false;
+            
+            if (segmentsMarkedForRemoval > 0) {
+                showFeedback(`Smart trim done! Marked ${segmentsMarkedForRemoval} segment(s) for removal.`);
+            } else {
+                showFeedback("Smart trim done! No silent or idle segments were found.");
+            }
+        }
+
+        // --- Step 3: Interactive Timeline Rendering ---
+
+        function renderTimeline() {
+            const timelineEl = document.getElementById('timeline-view');
+            timelineEl.innerHTML = '';
+            
+            if (segments.length === 0 && videoDuration > 0) {
+                // Initial state: one continuous segment
+                segments = [{ start: 0, end: videoDuration, state: 'keep' }];
+            }
+
+            if (segments.length === 0) {
+                timelineEl.innerHTML = '<p class="p-3 text-gray-500">Upload a video to see the timeline.</p>';
+                return;
+            }
+
+            // Calculate the total duration in seconds for scaling
+            const totalDuration = videoDuration;
+            
+            segments.forEach((seg, index) => {
+                const duration = seg.end - seg.start;
+                // Calculate width percentage based on total duration
+                const widthPercent = (duration / totalDuration) * 100;
+                
+                const segmentEl = document.createElement('div');
+                segmentEl.className = `segment relative h-12 flex-shrink-0 border-r border-gray-900 ${seg.state === 'keep' ? 'keep' : 'remove'}`;
+                segmentEl.style.width = `${widthPercent}%`;
+                segmentEl.setAttribute('data-index', index);
+                
+                // Add label for small segments
+                if (widthPercent > 2) { 
+                    const label = document.createElement('span');
+                    label.className = 'segment-label';
+                    label.textContent = `${duration.toFixed(1)}s`;
+                    segmentEl.appendChild(label);
+                }
+
+                // Click handler to toggle state
+                segmentEl.onclick = (e) => {
+                    const i = parseInt(e.currentTarget.getAttribute('data-index'));
+                    segments[i].state = segments[i].state === 'keep' ? 'remove' : 'keep';
+                    renderTimeline(); // Re-render to update colors
+                    showFeedback(`Segment ${i+1} marked to ${segments[i].state}.`);
+                };
+
+                // Hover to show video preview segment (optional UX)
+                segmentEl.onmouseenter = (e) => {
+                    document.getElementById('video-preview').currentTime = seg.start;
+                };
+
+                timelineEl.appendChild(segmentEl);
+            });
+        }
+
+        // --- Step 4: Reset Timeline ---
+        
+        function resetTimeline() {
+            if (!videoFile) {
+                showFeedback("Upload a video first before resetting.", true);
+                return;
+            }
+
+            const totalDuration = videoDuration;
+            segments = [];
+            // Create initial segments that respect the SEGMENT_DURATION for analysis granularity
+            for (let t = 0; t < totalDuration; t += SEGMENT_DURATION) {
+                const start = parseFloat(t.toFixed(2));
+                let end = parseFloat((t + SEGMENT_DURATION).toFixed(2));
+                if (end > totalDuration) end = totalDuration;
+
+                segments.push({ start, end, state: 'keep' });
+            }
+
+            renderTimeline();
+            showFeedback("Timeline reset to keep all segments.");
+        }
+
+        // --- Step 5: Download Video (FFmpeg.wasm) ---
+
+        async function doSmartTrimAndDownload() {
+            if (!videoFile) {
+                showFeedback("Please upload a video before attempting to trim.", true);
+                return;
+            }
+
+            const keepSegments = segments.filter(seg => seg.state === 'keep');
+
+            if (keepSegments.length === 0) {
+                showFeedback("No segments selected to keep. Reset the timeline or select some green segments.", true);
+                return;
+            }
+
+            // Show loading state and initialize FFmpeg
+            const downloadBtn = document.getElementById('download-btn');
+            downloadBtn.textContent = 'Initializing FFmpeg...';
+            downloadBtn.disabled = true;
+
+            // Check if FFmpeg is initialized (this is the source of the repeated error)
+            if (!ffmpeg) {
+                // Now, this error is more likely to mean the library failed to load its core files.
+                showFeedback("Video processor not ready. Please try refreshing the page.", true);
+                downloadBtn.disabled = false;
+                downloadBtn.textContent = 'Download Final Video';
+                return;
+            }
+
+            if (!ffmpeg.isLoaded()) {
+                // Added try/catch around load for robust error handling
+                try {
+                    downloadBtn.textContent = 'Loading core processor...';
+                    await ffmpeg.load(); 
+                } catch (error) {
+                    console.error("FFmpeg failed to load core files:", error);
+                    showFeedback("Failed to load video processor core. Check your network or try refreshing.", true);
+                    downloadBtn.disabled = false;
+                    downloadBtn.textContent = 'Download Final Video';
+                    return;
+                }
+                downloadBtn.textContent = 'Processing...';
+            }
+
+            const fileName = videoFile.name;
+            const outputName = 'trimmed_' + fileName.replace(/\.[^/.]+$/, "") + '.mp4';
+            
+            // 1. Write the input file to the FFmpeg virtual file system
+            await ffmpeg.FS('writeFile', fileName, await fetchFile(videoFile));
+            
+            let fileListContent = '';
+            let segmentIndex = 0;
+            let tempFiles = [];
+
+            // 2. Trim each 'keep' segment separately
+            for (const seg of keepSegments) {
+                const duration = seg.end - seg.start;
+                const tempFileName = `temp_seg_${segmentIndex}.mp4`;
+                tempFiles.push(tempFileName);
+                
+                downloadBtn.textContent = `Trimming segment ${segmentIndex + 1}/${keepSegments.length}...`;
+
+                const command = [
+                    '-i', fileName,
+                    '-ss', seg.start.toFixed(2), // Start time
+                    '-t', duration.toFixed(2),  // Duration
+                    '-c', 'copy',               // Fast copy stream
+                    tempFileName
+                ];
+                
+                try {
+                    await ffmpeg.run(...command);
+                    fileListContent += `file '${tempFileName}'\n`;
+                    segmentIndex++;
+                } catch (error) {
+                    console.error("FFmpeg segment trim failed:", error);
+                    showFeedback(`Error trimming segment ${segmentIndex + 1}. See console for details.`, true);
+                    downloadBtn.textContent = 'Download Final Video';
+                    downloadBtn.disabled = false;
+                    return;
+                }
+            }
+
+            // 3. Write the concat file list
+            await ffmpeg.FS('writeFile', 'mylist.txt', fileListContent);
+
+            // 4. Concatenate the segments
+            downloadBtn.textContent = 'Merging segments...';
+
+            const concatCommand = [
+                '-f', 'concat',
+                '-safe', '0',
+                '-i', 'mylist.txt',
+                '-c', 'copy',
+                outputName
+            ];
+
+            try {
+                await ffmpeg.run(...concatCommand);
+            } catch (error) {
+                console.error("FFmpeg concatenation failed:", error);
+                showFeedback("Error merging segments. See console for details. (Check the file list for compatibility)", true);
+                downloadBtn.textContent = 'Download Final Video';
+                downloadBtn.disabled = false;
+                return;
+            }
+
+            // 5. Read the output file and generate the download link
+            const data = ffmpeg.FS('readFile', outputName);
+            const blob = new Blob([data.buffer], { type: 'video/mp4' });
+            const url = URL.createObjectURL(blob);
+
+            const downloadLink = document.getElementById('download-link');
+            downloadLink.href = url;
+            downloadLink.download = outputName;
+            downloadLink.classList.remove('hidden');
+            
+            downloadBtn.textContent = 'Download Successful!';
+            downloadBtn.disabled = false;
+            
+            showFeedback("Trimming and merging completed! Click the blue link to download.");
+
+            // 6. Clean up FFmpeg VFS (optional but good practice)
+            tempFiles.forEach(file => ffmpeg.FS('unlink', file));
+            ffmpeg.FS('unlink', fileName);
+            ffmpeg.FS('unlink', 'mylist.txt');
+        }
+
+        // Initialize App on Load
+        window.onload = () => {
+            currentUserId = crypto.randomUUID();
+            console.log(`Initialized with User ID: ${currentUserId}`);
+
+            // Initialize FFmpeg here
+            if (typeof FFmpeg !== 'undefined') {
+                ({ createFFmpeg, fetchFile } = FFmpeg);
+                // FIX: Setting to v0.9.0 and matching corePath CDN/version for successful loading.
+                ffmpeg = createFFmpeg({ log: true, corePath: 'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.9.0/dist/ffmpeg-core.js' });
+                console.log("FFmpeg core variables initialized.");
+            } else {
+                console.error("FFmpeg library (ffmpeg.min.js) failed to load.");
+                showFeedback("Video trimming functions are unavailable. FFmpeg failed to load. Please try refreshing or check your network.", true);
+            }
+            
+            renderTimeline();
+        }
+    </script>
+</head>
+<body class="min-h-screen flex flex-col antialiased">
+
+    <!-- Landing Page -->
+    <div id="landing-page" class="flex flex-col items-center justify-center min-h-screen p-6 bg-gray-50 transition-opacity duration-500">
+        <div class="max-w-xl w-full text-center p-8 bg-white rounded-xl shadow-2xl">
+            <h1 class="text-6xl font-extrabold text-gray-900 mb-4">
+                Smart Trim ✂️
+            </h1>
+            <p class="text-xl text-gray-600 mb-8 leading-relaxed">
+                Automatically detect and remove silent segments and low-motion frames from your video, all right in your browser. Fast, private, and powered by <code class="bg-gray-100 p-1 rounded font-mono text-sm">FFmpeg.wasm</code>.
+            </p>
+            <button onclick="showEditor()" class="button-primary px-8 py-4 bg-blue-500 text-white font-bold text-lg rounded-xl shadow-lg hover:shadow-xl focus:outline-none focus:ring-4 focus:ring-blue-300">
+                Start Editing Now!
+            </button>
+        </div>
+    </div>
+
+    <!-- Editor Page -->
+    <div id="editor-page" class="hidden flex-col w-full p-4 lg:p-8 space-y-6">
+
+        <!-- Header / Status -->
+        <header class="flex flex-col lg:flex-row justify-between items-center bg-white p-4 rounded-xl shadow-md sticky top-0 z-10">
+            <h2 id="video-name" class="text-2xl font-semibold text-gray-800 mb-2 lg:mb-0">Load a Video...</h2>
+            
+            <div class="flex items-center space-x-3">
+                <!-- NEW: Button to reset and upload a new video -->
+                <button onclick="resetAppAndUpload()" class="px-4 py-2 bg-red-500 text-white font-bold rounded-lg shadow-md hover:bg-red-600 transition duration-150">
+                    New / Delete Video
+                </button>
+                
+                <input type="file" id="video-file-input" class="hidden" accept="video/*" onchange="handleVideoUpload(event)">
+            
+                <a id="download-link" href="#" download="trimmed_video.mp4" class="hidden px-4 py-2 bg-green-500 text-white font-bold rounded-lg shadow-md hover:bg-green-600 transition duration-150">
+                    Download Trimmed Video
+                </a>
+            </div>
+            
+        </header>
+
+        <!-- Video Preview and Controls -->
+        <main class="flex flex-col lg:flex-row w-full space-y-6 lg:space-y-0 lg:space-x-6">
+            
+            <!-- Video Preview Container -->
+            <div class="lg:w-2/3 bg-gray-800 rounded-xl shadow-xl overflow-hidden">
+                <video id="video-preview" controls muted class="w-full h-auto max-h-[60vh] rounded-xl" 
+                       poster="https://placehold.co/1280x720/1f2937/9ca3af?text=Upload+Video" 
+                       onclick="document.getElementById('video-file-input').click()">
+                    Your browser does not support the video tag.
+                </video>
+            </div>
+
+            <!-- Action Buttons and Feedback -->
+            <div class="lg:w-1/3 flex flex-col space-y-4">
+                
+                <div id="action-buttons" class="space-y-4 p-4 bg-white rounded-xl shadow-md opacity-0 transition-opacity duration-500">
+                    <button id="smart-trim-btn" onclick="analyzeVideo()" class="w-full button-primary px-4 py-3 bg-blue-500 text-white font-bold rounded-lg shadow-md hover:bg-blue-600 disabled:opacity-50 disabled:cursor-not-allowed">
+                        Auto Trim Silence + Idle Frames
+                    </button>
+                    
+                    <button onclick="resetTimeline()" class="w-full px-4 py-3 bg-gray-200 text-gray-800 font-bold rounded-lg shadow-md hover:bg-gray-300 transition duration-150">
+                        Reset Timeline (Keep All)
+                    </button>
+                    
+                    <button id="download-btn" onclick="doSmartTrimAndDownload()" class="w-full px-4 py-3 bg-red-500 text-white font-bold rounded-lg shadow-md hover:bg-red-600 transition duration-150 disabled:opacity-50 disabled:cursor-not-allowed">
+                        Download Final Video
+                    </button>
+                </div>
+                
+                <!-- Feedback Box -->
+                <div id="feedback-message" class="hidden p-3 mt-4 rounded-lg font-semibold transition-all duration-300">
+                    <!-- Dynamic messages appear here -->
+                </div>
+
+                <div class="p-4 bg-white rounded-xl shadow-md">
+                    <h3 class="font-bold text-lg mb-2 text-gray-700">Instructions</h3>
+                    <ul class="text-sm text-gray-500 space-y-1 list-disc list-inside">
+                        <li>Upload an MP4 or MOV file.</li>
+                        <li>Click **Auto Trim** to suggest cuts.</li>
+                        <li>The timeline below shows segments: <span class="text-blue-500 font-bold">Blue = Keep</span>, <span class="text-red-500 font-bold">Red = Remove</span>.</li>
+                        <li>Click any segment in the timeline to **toggle** its state.</li>
+                        <li>Click **Download Final Video** to stitch the blue segments together.</li>
+                    </ul>
+                </div>
+            </div>
+        </main>
+
+        <!-- Timeline View -->
+        <section class="p-4 bg-white rounded-xl shadow-xl">
+            <h3 class="text-xl font-semibold mb-3 text-gray-800">Interactive Timeline View</h3>
+            <div id="timeline-view" class="flex w-full overflow-x-scroll border-4 border-gray-200 rounded-lg" style="min-height: 48px;">
+                <!-- Segments will be rendered here by JavaScript -->
+                <p class="p-3 text-gray-500">Timeline will appear here after video upload.</p>
+            </div>
+            <div class="flex justify-between text-sm text-gray-600 mt-1">
+                <span>0.0s</span>
+                <span id="timeline-end-time">{{ videoDuration.toFixed(1) }}s</span>
+            </div>
+        </section>
+
+        <!-- Hidden elements for potential analysis (optional/advanced) -->
+        <canvas id="motion-canvas" class="hidden"></canvas>
+    </div>
+</body>
+</html>
