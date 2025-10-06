@@ -5,8 +5,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>In-Browser Smart Trimmer</title>
     <script src="https://cdn.tailwindcss.com"></script>
-    <!-- FIX: Reverting to the highly stable FFmpeg v0.9.0, which resolves many core loading issues (createFFmpegCore not defined) in restricted environments. -->
-    <script src="https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.9.0/dist/ffmpeg.min.js"></script>
+    <!-- FIX: Using FFmpeg v0.10.0 to mitigate the WebAssembly memory allocation error (RangeError). -->
+    <script src="https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.10.0/dist/ffmpeg.min.js"></script>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@100..900&display=swap" rel="stylesheet">
@@ -414,8 +414,8 @@
             // Initialize FFmpeg here
             if (typeof FFmpeg !== 'undefined') {
                 ({ createFFmpeg, fetchFile } = FFmpeg);
-                // FIX: Setting to v0.9.0 and matching corePath CDN/version for successful loading.
-                ffmpeg = createFFmpeg({ log: true, corePath: 'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.9.0/dist/ffmpeg-core.js' });
+                // FIX: Using FFmpeg v0.10.0 to mitigate the WebAssembly memory allocation error.
+                ffmpeg = createFFmpeg({ log: true, corePath: 'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.10.0/dist/ffmpeg-core.js' });
                 console.log("FFmpeg core variables initialized.");
             } else {
                 console.error("FFmpeg library (ffmpeg.min.js) failed to load.");
